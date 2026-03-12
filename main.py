@@ -116,14 +116,13 @@ def check_ram_and_maybe_fallback():
 
 def load_session():
     """Load or reload the rembg session with the current model."""
-    global rembg_session
+    global rembg_session, current_model
     log.info(f"Loading model: {current_model} ...")
     try:
         rembg_session = build_session(current_model)
     except Exception as e:
         log.error(f"Failed to load {current_model}: {e}")
         # Try next in fallback chain
-        global current_model
         if current_model in FALLBACK_CHAIN:
             idx = FALLBACK_CHAIN.index(current_model)
             for fallback in FALLBACK_CHAIN[idx + 1:]:
