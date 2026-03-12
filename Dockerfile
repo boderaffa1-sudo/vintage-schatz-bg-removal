@@ -10,12 +10,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY app.py .
+COPY main.py processor.py gdrive.py ./
 
-# Pre-download the default model so container start is faster
-RUN python -c "from rembg import new_session; new_session('isnet-general-use')" || true
-
+# ONNX thread limits (also settable via Railway env vars)
+ENV OMP_NUM_THREADS=2
+ENV ORT_THREADS=2
 ENV PORT=8080
+
 EXPOSE 8080
 
-CMD ["python", "-u", "app.py"]
+CMD ["python", "-u", "main.py"]
