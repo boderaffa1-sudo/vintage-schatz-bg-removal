@@ -1,0 +1,5 @@
+rembg[gpu]==2.0.57
+Pillow>=10.0.0
+google-auth>=2.22.0
+google-api-python-client>=2.100.0
+onnxruntime>=1.16.0
