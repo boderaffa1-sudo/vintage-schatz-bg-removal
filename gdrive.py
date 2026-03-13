@@ -40,14 +40,18 @@ def authenticate():
     if not sa_json_str:
         raise RuntimeError("GOOGLE_SERVICE_ACCOUNT_JSON env var is not set")
 
-    log.info(f"SA JSON length: {len(sa_json_str)} chars")
-    log.info(f"SA JSON first 80 chars: {sa_json_str[:80]}")
     sa_info = json.loads(sa_json_str)
-    log.info(f"SA JSON keys: {list(sa_info.keys())}")
-    log.info(f"Has token_uri: {'token_uri' in sa_info}")
     creds = service_account.Credentials.from_service_account_info(
         sa_info, scopes=["https://www.googleapis.com/auth/drive"]
     )
+
+    # Domain-wide delegation: impersonate a real user so uploads
+    # count against their storage quota (SA has zero quota).
+    impersonate_email = os.environ.get("GOOGLE_IMPERSONATE_EMAIL", "")
+    if impersonate_email:
+        creds = creds.with_subject(impersonate_email)
+        log.info(f"Impersonating: {impersonate_email}")
+
     service = build("drive", "v3", credentials=creds, cache_discovery=False)
     log.info(f"Authenticated as {sa_info.get('client_email', '?')}")
     return service
