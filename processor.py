@@ -1,87 +1,152 @@
 """
-Image processing: background removal with rembg + white background compositing.
-Includes ONNX thread limiting and memory cleanup.
+Image processing via remove.bg API.
+Pipeline: Quality Check → remove.bg → Result Check → Shadow → Resize
 """
-import gc
 import io
-import os
 import logging
+import time
 
-import onnxruntime as ort
-from PIL import Image
-from rembg import new_session, remove
+import numpy as np
+import requests
+from PIL import Image, ImageFilter
 
 log = logging.getLogger("whitebg.processor")
 
 
-def build_session(model_name: str):
-    """Build rembg session with ONNX thread limits for Railway CPU protection."""
-    ort_threads = int(os.getenv("ORT_THREADS", "2"))
+# ============================================================
+# Step 1: Quality Check BEFORE API (free, no credit used)
+# ============================================================
+def check_quality(image_bytes: bytes) -> tuple:
+    """Check blur + brightness. Returns (ok, reason)."""
+    img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    # Blur check (Laplacian-like via numpy diffs)
+    gray = img.convert("L")
+    arr = np.array(gray, dtype=float)
+    laplacian = np.abs(np.diff(np.diff(arr, axis=0), axis=0)).mean()
+    if laplacian < 15:
+        return False, f"Zu unscharf (Score: {laplacian:.1f})"
+    # Brightness check
+    brightness = np.array(img).mean()
+    if brightness < 30:
+        return False, f"Zu dunkel (Helligkeit: {brightness:.0f})"
+    return True, "OK"
 
-    sess_options = ort.SessionOptions()
-    sess_options.intra_op_num_threads = ort_threads
-    sess_options.inter_op_num_threads = 1
-    sess_options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
-    # Disable spin-waiting = less CPU idle load
-    sess_options.add_session_config_entry("session.intra_op.allow_spinning", "0")
 
-    log.info(f"Building rembg session: model={model_name}, ort_threads={ort_threads}")
-    session = new_session(model_name)
-    log.info(f"Model {model_name} loaded successfully")
-    return session
+# ============================================================
+# Step 2: remove.bg API
+# ============================================================
+def remove_background(image_bytes: bytes, api_key: str) -> bytes:
+    """Call remove.bg API with crop + scale + white BG."""
+    response = requests.post(
+        "https://api.remove.bg/v1.0/removebg",
+        files={"image_file": ("image.jpg", image_bytes, "image/jpeg")},
+        data={
+            "size": "auto",
+            "crop": "true",
+            "crop_margin": "5%",
+            "scale": "85%",
+            "position": "center",
+            "bg_color": "ffffff",
+            "format": "jpg",
+        },
+        headers={"X-Api-Key": api_key},
+        timeout=60,
+    )
+    if response.status_code != 200:
+        raise Exception(f"remove.bg Fehler: {response.status_code} {response.text}")
+    return response.content
 
 
-def process_image(image_bytes: bytes, session, max_size: int = 2400, jpeg_quality: int = 90) -> bytes:
-    """
-    Remove background from image and composite onto white background.
+# ============================================================
+# Step 3: Result Check (too much removed?)
+# ============================================================
+def check_result(image_bytes: bytes) -> tuple:
+    """Check if API removed too much (>92% white)."""
+    img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    arr = np.array(img)
+    white_mask = (arr[:, :, 0] > 240) & (arr[:, :, 1] > 240) & (arr[:, :, 2] > 240)
+    white_ratio = white_mask.mean()
+    if white_ratio > 0.92:
+        return False, f"API hat zu viel entfernt ({white_ratio*100:.0f}% weiß)"
+    return True, "OK"
 
-    Steps:
-    1. Open image, resize to max_size BEFORE rembg (important for BiRefNet)
-    2. Run rembg.remove() -> RGBA with transparent BG
-    3. Composite onto white #FFFFFF background
-    4. Export as JPEG at specified quality
-    5. Cleanup memory (gc.collect)
-    """
-    img = Image.open(io.BytesIO(image_bytes))
-    original_size = img.size
-    log.info(f"  Input: {img.size[0]}x{img.size[1]}, mode={img.mode}")
 
-    # Step 1: Resize BEFORE rembg (BiRefNet trained on 1024x1024, large input = more RAM)
+# ============================================================
+# Step 4: Soft Shadow via Pillow
+# ============================================================
+def add_shadow(image_bytes: bytes) -> bytes:
+    """Add subtle drop shadow under the object."""
+    img = Image.open(io.BytesIO(image_bytes)).convert("RGBA")
+    shadow_offset = (8, 12)
+    shadow_blur = 18
+    shadow_opacity = 60
     w, h = img.size
-    if max(w, h) > max_size:
-        ratio = max_size / max(w, h)
-        new_w, new_h = int(w * ratio), int(h * ratio)
-        img = img.resize((new_w, new_h), Image.LANCZOS)
-        log.info(f"  Resized: {original_size[0]}x{original_size[1]} -> {new_w}x{new_h}")
+    canvas = Image.new("RGBA", (w + 40, h + 40), (255, 255, 255, 255))
+    # Create shadow from alpha channel
+    alpha = img.split()[3]
+    shadow = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    shadow.putalpha(alpha)
+    shadow = shadow.filter(ImageFilter.GaussianBlur(shadow_blur))
+    # Set shadow color to dark gray
+    shadow_arr = np.array(shadow)
+    shadow_arr[:, :, :3] = 100
+    shadow_arr[:, :, 3] = (shadow_arr[:, :, 3] * shadow_opacity / 255).astype(np.uint8)
+    shadow = Image.fromarray(shadow_arr)
+    # Paste: shadow first, then image
+    canvas.paste(shadow, (20 + shadow_offset[0], 20 + shadow_offset[1]), shadow)
+    canvas.paste(img, (20, 20), img)
+    # Export as JPEG
+    result = Image.new("RGB", canvas.size, (255, 255, 255))
+    result.paste(canvas, mask=canvas.split()[3])
+    output = io.BytesIO()
+    result.save(output, format="JPEG", quality=90)
+    return output.getvalue()
 
-    # Convert to RGB for consistent input
-    if img.mode != "RGB":
-        img = img.convert("RGB")
 
-    # Step 2: Remove background
-    input_buf = io.BytesIO()
-    img.save(input_buf, format="PNG")
-    input_buf.seek(0)
-    input_bytes_png = input_buf.getvalue()
+# ============================================================
+# Step 5: Resize to max 2400px
+# ============================================================
+def resize_final(image_bytes: bytes, max_px: int = 2400) -> bytes:
+    """Resize to max_px, never upscale."""
+    img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    if max(img.size) > max_px:
+        img.thumbnail((max_px, max_px), Image.LANCZOS)
+    output = io.BytesIO()
+    img.save(output, format="JPEG", quality=90)
+    return output.getvalue()
 
-    result_bytes = remove(input_bytes_png, session=session)
-    result_img = Image.open(io.BytesIO(result_bytes)).convert("RGBA")
 
-    # Step 3: Composite onto white background
-    white_bg = Image.new("RGBA", result_img.size, (255, 255, 255, 255))
-    white_bg.paste(result_img, mask=result_img.split()[3])
-    final = white_bg.convert("RGB")
+# ============================================================
+# Main pipeline
+# ============================================================
+def process_image(image_bytes: bytes, filename: str, api_key: str) -> tuple:
+    """
+    Full pipeline: Quality → remove.bg → Result Check → Shadow → Resize.
+    Returns (result_bytes | None, status_message).
+    """
+    # 1. Quality check (free, no API credit used on failure)
+    ok, reason = check_quality(image_bytes)
+    if not ok:
+        return None, f"SKIP Qualität: {reason}"
 
-    # Step 4: Export as JPEG
-    output_buf = io.BytesIO()
-    final.save(output_buf, format="JPEG", quality=jpeg_quality, optimize=True)
-    output_buf.seek(0)
-    result = output_buf.getvalue()
+    # 2. remove.bg API
+    try:
+        result = remove_background(image_bytes, api_key)
+    except Exception as e:
+        return None, f"FEHLER API: {e}"
 
-    log.info(f"  Output: {final.size[0]}x{final.size[1]}, {len(result)} bytes JPEG")
+    # Rate limit protection: 0.5s between API calls
+    time.sleep(0.5)
 
-    # Step 5: Explicit memory cleanup (onnxruntime RAM leak with varying image sizes)
-    del img, input_buf, input_bytes_png, result_bytes, result_img, white_bg, final, output_buf
-    gc.collect()
+    # 3. Result check
+    ok, reason = check_result(result)
+    if not ok:
+        return None, f"SKIP Ergebnis: {reason}"
 
-    return result
+    # 4. Shadow
+    result = add_shadow(result)
+
+    # 5. Resize
+    result = resize_final(result)
+
+    return result, "OK"

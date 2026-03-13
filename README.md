@@ -1,22 +1,31 @@
 # WhiteBG-Service (vintage-schatz-bg-removal)
 
-Automated background removal for Google Drive images.
+Automated background removal for Google Drive images using **remove.bg API**.
 Polls a root folder recursively, finds images without `_weiss` counterparts,
-removes background via rembg, composites onto white #FFFFFF, and uploads `_weiss.jpg` back.
+removes background, adds soft shadow, and uploads `_weiss.jpg` back.
 
 ## Architecture
 
 ```
-main.py          ← Main loop + RAM monitor + health check
-processor.py     ← rembg + white background + ONNX thread limits
+main.py          ← Main loop + health check + polling
+processor.py     ← remove.bg API + quality check + shadow + resize
 gdrive.py        ← Drive API + exponential backoff (tenacity)
 ```
 
+## Pipeline (per image)
+
+1. **Quality Check** — blur + brightness (Pillow, free, no API credit used)
+2. **remove.bg API** — crop + scale 85% + center + white BG
+3. **Result Check** — detect if API removed too much (>92% white)
+4. **Soft Shadow** — subtle drop shadow via Pillow (free)
+5. **Resize** — max 2400px, JPEG 90%
+6. **Upload** — back to same Drive folder as `originalname_weiss.jpg`
+
 ## Key Features
 
-- **RAM Monitor**: Auto-fallback to lighter model when RAM exceeds threshold
-- **Model Fallback Chain**: birefnet-general → birefnet-general-lite → isnet-general-use → u2net
-- **ONNX Thread Limits**: Prevents CPU throttling on Railway
+- **No RAM issues**: Cloud API, no local model needed
+- **Quality gate**: Bad images skipped before API call (saves credits)
+- **Professional shadow**: Subtle drop shadow for eBay/Etsy/Pamono
 - **Exponential Backoff**: tenacity retry on Drive API 429/503 errors
 - **Idempotent**: Never re-processes files that already have a `_weiss` counterpart
 - **Non-destructive**: Originals are NEVER modified or deleted
@@ -25,29 +34,28 @@ gdrive.py        ← Drive API + exponential backoff (tenacity)
 
 | Variable | Required | Default | Description |
 |---|---|---|---|
+| `REMOVEBG_API_KEY` | ✅ | - | API key from remove.bg |
 | `GOOGLE_SERVICE_ACCOUNT_JSON` | ✅ | - | Full JSON of Service Account key |
 | `GDRIVE_ROOT_FOLDER_ID` | ✅ | - | Root folder to poll |
-| `REMBG_MODEL` | ❌ | `birefnet-general-lite` | rembg model |
 | `POLL_INTERVAL_MINUTES` | ❌ | `60` | Poll interval |
-| `MAX_IMAGE_SIZE_PX` | ❌ | `2400` | Resize before rembg |
-| `JPEG_QUALITY` | ❌ | `90` | Output JPEG quality |
-| `ORT_THREADS` | ❌ | `2` | ONNX intra-op threads |
-| `OMP_NUM_THREADS` | ❌ | `2` | OpenMP thread limit |
-| `MAX_RAM_PERCENT` | ❌ | `80` | Auto-fallback trigger |
 | `LOG_LEVEL` | ❌ | `INFO` | Python log level |
 | `DRY_RUN` | ❌ | `false` | Skip upload |
 | `PORT` | ❌ | `8080` | Health check port |
 
 ## Deploy to Railway
 
-1. Push repo to GitHub
-2. New Railway project → Deploy from GitHub
-3. Set env vars (see above), especially `GOOGLE_SERVICE_ACCOUNT_JSON`
-4. Share Drive root folder with SA email as **Editor**
-5. Deploy — model downloads on first start (~30s)
+1. Get API key from https://www.remove.bg/api
+2. Push repo to GitHub
+3. New Railway project → Deploy from GitHub
+4. Set env vars (see above)
+5. Share Drive root folder with SA email as **Editor**
+6. Deploy — no model download needed, starts instantly
 
-**Tip**: Start with `REMBG_MODEL=birefnet-general-lite` on Hobby plan.
-If OOM crashes: switch to `isnet-general-use`.
+## Costs
+
+- ~€0.03–0.04 per image (remove.bg)
+- 3,000 images ≈ €90–120 one-time
+- Railway Hobby plan: free (500h/month)
 
 ## Skip Rules
 
