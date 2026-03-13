@@ -21,7 +21,7 @@ from processor import process_image
 # Configuration
 # ============================================================
 GDRIVE_ROOT_FOLDER_ID = os.environ.get("GDRIVE_ROOT_FOLDER_ID", "1nJk2cI1FlOX5a5fy5w9JRAODNPuEEwP2")
-REMOVEBG_API_KEY = os.environ.get("REMOVEBG_API_KEY", "")
+# rembg URL is configured in processor.py via REMBG_URL env var
 POLL_INTERVAL_MINUTES = int(os.environ.get("POLL_INTERVAL_MINUTES", "60"))
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO")
 DRY_RUN = os.environ.get("DRY_RUN", "false").lower() == "true"
@@ -58,7 +58,7 @@ class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         body = json.dumps({
             "status": "ok",
-            "service": "whitebg-removebg",
+            "service": "whitebg-rembg",
             "stats": stats_total,
         })
         self.send_response(200)
@@ -185,8 +185,8 @@ def process_folder(service, folder_id, folder_name, stats):
             raw_bytes = download_file(service, file_id)
             log.info(f"  Downloaded: {len(raw_bytes):,} bytes")
 
-            # Process via remove.bg pipeline
-            result_bytes, status = process_image(raw_bytes, name, REMOVEBG_API_KEY)
+            # Process via rembg pipeline (free, self-hosted)
+            result_bytes, status = process_image(raw_bytes, name)
 
             if result_bytes is None:
                 log.warning(f"  ⏭️ {status}")
@@ -225,14 +225,10 @@ def process_recursive(service, folder_id, folder_name, stats, depth=0):
 # Main
 # ============================================================
 def main():
-    if not REMOVEBG_API_KEY:
-        log.error("REMOVEBG_API_KEY env var is not set! Exiting.")
-        sys.exit(1)
-
     log.info("=" * 60)
-    log.info("WhiteBG-Service (remove.bg) starting")
+    log.info("WhiteBG-Service (rembg, free) starting")
     log.info(f"  Root folder:  {GDRIVE_ROOT_FOLDER_ID}")
-    log.info(f"  API key:      {REMOVEBG_API_KEY[:8]}...")
+    log.info(f"  rembg URL:    {os.environ.get('REMBG_URL', 'https://rembg-new-production.up.railway.app')}")
     log.info(f"  Poll:         {POLL_INTERVAL_MINUTES} min")
     log.info(f"  Dry run:      {DRY_RUN}")
     log.info("=" * 60)
