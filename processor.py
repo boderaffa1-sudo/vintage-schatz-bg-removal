@@ -35,26 +35,33 @@ def check_quality(image_bytes: bytes) -> tuple:
 # ============================================================
 # Step 2: remove.bg API
 # ============================================================
-def remove_background(image_bytes: bytes, api_key: str) -> bytes:
-    """Call remove.bg API with crop + scale + white BG."""
-    response = requests.post(
-        "https://api.remove.bg/v1.0/removebg",
-        files={"image_file": ("image.jpg", image_bytes, "image/jpeg")},
-        data={
-            "size": "auto",
-            "crop": "true",
-            "crop_margin": "5%",
-            "scale": "85%",
-            "position": "center",
-            "bg_color": "ffffff",
-            "format": "jpg",
-        },
-        headers={"X-Api-Key": api_key},
-        timeout=60,
-    )
-    if response.status_code != 200:
+def remove_background(image_bytes: bytes, api_key: str, max_retries: int = 4) -> bytes:
+    """Call remove.bg API with crop + scale + white BG. Retries on 429."""
+    for attempt in range(max_retries + 1):
+        response = requests.post(
+            "https://api.remove.bg/v1.0/removebg",
+            files={"image_file": ("image.jpg", image_bytes, "image/jpeg")},
+            data={
+                "size": "auto",
+                "crop": "true",
+                "crop_margin": "5%",
+                "scale": "85%",
+                "position": "center",
+                "bg_color": "ffffff",
+                "format": "jpg",
+            },
+            headers={"X-Api-Key": api_key},
+            timeout=60,
+        )
+        if response.status_code == 200:
+            return response.content
+        if response.status_code == 429 and attempt < max_retries:
+            wait = 5 * (2 ** attempt)  # 5s, 10s, 20s, 40s
+            log.warning(f"  Rate limit 429, waiting {wait}s (attempt {attempt+1}/{max_retries})")
+            time.sleep(wait)
+            continue
         raise Exception(f"remove.bg Fehler: {response.status_code} {response.text}")
-    return response.content
+    raise Exception("remove.bg: max retries exceeded")
 
 
 # ============================================================
@@ -135,8 +142,8 @@ def process_image(image_bytes: bytes, filename: str, api_key: str) -> tuple:
     except Exception as e:
         return None, f"FEHLER API: {e}"
 
-    # Rate limit protection: 0.5s between API calls
-    time.sleep(0.5)
+    # Rate limit protection: 2s between API calls
+    time.sleep(2)
 
     # 3. Result check
     ok, reason = check_result(result)
