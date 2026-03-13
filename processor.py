@@ -1,6 +1,6 @@
 """
 Image processing via remove.bg API.
-Pipeline: Quality Check → remove.bg → Result Check → Shadow → Resize
+Pipeline: Quality Check → remove.bg (with shadow) → Result Check → Resize
 """
 import io
 import logging
@@ -8,7 +8,7 @@ import time
 
 import numpy as np
 import requests
-from PIL import Image, ImageFilter
+from PIL import Image
 
 log = logging.getLogger("whitebg.processor")
 
@@ -43,12 +43,15 @@ def remove_background(image_bytes: bytes, api_key: str, max_retries: int = 4) ->
             files={"image_file": ("image.jpg", image_bytes, "image/jpeg")},
             data={
                 "size": "auto",
+                "type": "product",
                 "crop": "true",
                 "crop_margin": "5%",
                 "scale": "85%",
                 "position": "center",
                 "bg_color": "ffffff",
                 "format": "jpg",
+                "shadow_type": "drop",
+                "shadow_opacity": "50",
             },
             headers={"X-Api-Key": api_key},
             timeout=60,
@@ -81,39 +84,7 @@ def check_result(image_bytes: bytes) -> tuple:
 
 
 # ============================================================
-# Step 4: Soft Shadow via Pillow
-# ============================================================
-def add_shadow(image_bytes: bytes) -> bytes:
-    """Add subtle drop shadow under the object."""
-    img = Image.open(io.BytesIO(image_bytes)).convert("RGBA")
-    shadow_offset = (8, 12)
-    shadow_blur = 18
-    shadow_opacity = 60
-    w, h = img.size
-    canvas = Image.new("RGBA", (w + 40, h + 40), (255, 255, 255, 255))
-    # Create shadow from alpha channel
-    alpha = img.split()[3]
-    shadow = Image.new("RGBA", (w, h), (0, 0, 0, 0))
-    shadow.putalpha(alpha)
-    shadow = shadow.filter(ImageFilter.GaussianBlur(shadow_blur))
-    # Set shadow color to dark gray
-    shadow_arr = np.array(shadow)
-    shadow_arr[:, :, :3] = 100
-    shadow_arr[:, :, 3] = (shadow_arr[:, :, 3] * shadow_opacity / 255).astype(np.uint8)
-    shadow = Image.fromarray(shadow_arr)
-    # Paste: shadow first, then image
-    canvas.paste(shadow, (20 + shadow_offset[0], 20 + shadow_offset[1]), shadow)
-    canvas.paste(img, (20, 20), img)
-    # Export as JPEG
-    result = Image.new("RGB", canvas.size, (255, 255, 255))
-    result.paste(canvas, mask=canvas.split()[3])
-    output = io.BytesIO()
-    result.save(output, format="JPEG", quality=90)
-    return output.getvalue()
-
-
-# ============================================================
-# Step 5: Resize to max 2400px
+# Step 4: Resize to max 2400px
 # ============================================================
 def resize_final(image_bytes: bytes, max_px: int = 2400) -> bytes:
     """Resize to max_px, never upscale."""
@@ -130,7 +101,7 @@ def resize_final(image_bytes: bytes, max_px: int = 2400) -> bytes:
 # ============================================================
 def process_image(image_bytes: bytes, filename: str, api_key: str) -> tuple:
     """
-    Full pipeline: Quality → remove.bg → Result Check → Shadow → Resize.
+    Full pipeline: Quality → remove.bg (with shadow) → Result Check → Resize.
     Returns (result_bytes | None, status_message).
     """
     # 1. Quality check (free, no API credit used on failure)
@@ -152,10 +123,7 @@ def process_image(image_bytes: bytes, filename: str, api_key: str) -> tuple:
     if not ok:
         return None, f"SKIP Ergebnis: {reason}"
 
-    # 4. Shadow
-    result = add_shadow(result)
-
-    # 5. Resize
+    # 4. Resize (shadow is now done by remove.bg API)
     result = resize_final(result)
 
     return result, "OK"

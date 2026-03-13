@@ -12,6 +12,8 @@ import threading
 from pathlib import Path
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
+import requests as http_requests
+
 from gdrive import authenticate, list_subfolders, list_images, download_file, upload_file
 from processor import process_image
 
@@ -23,6 +25,11 @@ REMOVEBG_API_KEY = os.environ.get("REMOVEBG_API_KEY", "")
 POLL_INTERVAL_MINUTES = int(os.environ.get("POLL_INTERVAL_MINUTES", "60"))
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO")
 DRY_RUN = os.environ.get("DRY_RUN", "false").lower() == "true"
+
+# Airtable config for measurement photo cache
+AIRTABLE_TOKEN = os.environ.get("AIRTABLE_TOKEN", "")
+AIRTABLE_BASE = os.environ.get("AIRTABLE_BASE", "appWh8CQNQbpI1tLJ")
+AIRTABLE_PHOTOS_TABLE = os.environ.get("AIRTABLE_PHOTOS_TABLE", "tblXd0poan6Sz53TR")
 
 # Folders to skip during recursive scan
 SKIP_FOLDERS = {"glas-archiv", "qualitaet-pruefen", "glas-bearbeitung-ausstehend", "glas-fertig"}
@@ -92,6 +99,34 @@ def should_skip(filename):
     return False
 
 
+def is_measurement_photo_cached(filename):
+    """Check Airtable cache if this photo is a measurement photo (Zollstock).
+    Returns True if cached as measurement, False otherwise.
+    Returns False on any error (fail-open: process the photo if unsure).
+    """
+    if not AIRTABLE_TOKEN:
+        return False
+    try:
+        url = f"https://api.airtable.com/v0/{AIRTABLE_BASE}/{AIRTABLE_PHOTOS_TABLE}"
+        safe_name = filename.replace("'", "\\'")
+        params = {
+            "filterByFormula": f"AND({{Photo Name}}='{safe_name}',{{Ruler_Checked}}=TRUE(),{{Is_Measurement_Photo}}=TRUE())",
+            "maxRecords": "1",
+            "fields[]": ["Photo Name", "Is_Measurement_Photo"],
+        }
+        headers = {"Authorization": f"Bearer {AIRTABLE_TOKEN}"}
+        resp = http_requests.get(url, params=params, headers=headers, timeout=10)
+        if resp.status_code == 200:
+            records = resp.json().get("records", [])
+            if records:
+                log.info(f"  ⏭️ Airtable: {filename} is measurement photo (cached)")
+                return True
+        return False
+    except Exception as e:
+        log.warning(f"  Airtable check failed for {filename}: {e}")
+        return False
+
+
 # ============================================================
 # Folder Processing
 # ============================================================
@@ -117,6 +152,11 @@ def process_folder(service, folder_id, folder_name, stats):
 
         weiss_name = get_weiss_name(name)
         if weiss_name.lower() in existing_names:
+            stats["skipped"] += 1
+            continue
+
+        # Skip measurement photos (Zollstock) via Airtable cache
+        if is_measurement_photo_cached(name):
             stats["skipped"] += 1
             continue
 
