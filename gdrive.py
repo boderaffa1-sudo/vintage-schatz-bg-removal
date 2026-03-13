@@ -8,6 +8,8 @@ import json
 import logging
 
 from google.oauth2 import service_account
+from google.oauth2.credentials import Credentials
+from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
 from googleapiclient.errors import HttpError
@@ -35,26 +37,43 @@ _retry_drive = retry(
 
 
 def authenticate():
-    """Build Google Drive service from Service Account JSON in env var."""
+    """Build Google Drive service.
+    
+    Prefers OAuth2 refresh token (works with Gmail, uses user's storage quota).
+    Falls back to Service Account (SA has zero storage quota on Gmail accounts).
+    """
+    refresh_token = os.environ.get("GOOGLE_REFRESH_TOKEN", "")
+    client_id = os.environ.get("GOOGLE_CLIENT_ID", "")
+    client_secret = os.environ.get("GOOGLE_CLIENT_SECRET", "")
+
+    if refresh_token and client_id and client_secret:
+        # OAuth2: authenticate as real user → uses their 2TB quota
+        creds = Credentials(
+            token=None,
+            refresh_token=refresh_token,
+            client_id=client_id,
+            client_secret=client_secret,
+            token_uri="https://oauth2.googleapis.com/token",
+            scopes=["https://www.googleapis.com/auth/drive"],
+        )
+        creds.refresh(Request())
+        service = build("drive", "v3", credentials=creds, cache_discovery=False)
+        log.info(f"Authenticated via OAuth2 (user account)")
+        return service
+
+    # Fallback: Service Account (read-only useful; uploads fail on Gmail)
     sa_json_str = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "")
-    if not sa_json_str:
-        raise RuntimeError("GOOGLE_SERVICE_ACCOUNT_JSON env var is not set")
+    if sa_json_str:
+        sa_info = json.loads(sa_json_str)
+        creds = service_account.Credentials.from_service_account_info(
+            sa_info, scopes=["https://www.googleapis.com/auth/drive"]
+        )
+        service = build("drive", "v3", credentials=creds, cache_discovery=False)
+        log.info(f"Authenticated as SA: {sa_info.get('client_email', '?')}")
+        log.warning("SA auth: uploads may fail (no storage quota on Gmail accounts)")
+        return service
 
-    sa_info = json.loads(sa_json_str)
-    creds = service_account.Credentials.from_service_account_info(
-        sa_info, scopes=["https://www.googleapis.com/auth/drive"]
-    )
-
-    # Domain-wide delegation: impersonate a real user so uploads
-    # count against their storage quota (SA has zero quota).
-    impersonate_email = os.environ.get("GOOGLE_IMPERSONATE_EMAIL", "")
-    if impersonate_email:
-        creds = creds.with_subject(impersonate_email)
-        log.info(f"Impersonating: {impersonate_email}")
-
-    service = build("drive", "v3", credentials=creds, cache_discovery=False)
-    log.info(f"Authenticated as {sa_info.get('client_email', '?')}")
-    return service
+    raise RuntimeError("No auth configured! Set GOOGLE_REFRESH_TOKEN or GOOGLE_SERVICE_ACCOUNT_JSON")
 
 
 @_retry_drive
