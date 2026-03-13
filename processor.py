@@ -23,7 +23,7 @@ def check_quality(image_bytes: bytes) -> tuple:
     gray = img.convert("L")
     arr = np.array(gray, dtype=float)
     laplacian = np.abs(np.diff(np.diff(arr, axis=0), axis=0)).mean()
-    if laplacian < 15:
+    if laplacian < 1.0:
         return False, f"Zu unscharf (Score: {laplacian:.1f})"
     # Brightness check
     brightness = np.array(img).mean()
