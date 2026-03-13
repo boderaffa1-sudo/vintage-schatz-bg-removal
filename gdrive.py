@@ -40,7 +40,11 @@ def authenticate():
     if not sa_json_str:
         raise RuntimeError("GOOGLE_SERVICE_ACCOUNT_JSON env var is not set")
 
+    log.info(f"SA JSON length: {len(sa_json_str)} chars")
+    log.info(f"SA JSON first 80 chars: {sa_json_str[:80]}")
     sa_info = json.loads(sa_json_str)
+    log.info(f"SA JSON keys: {list(sa_info.keys())}")
+    log.info(f"Has token_uri: {'token_uri' in sa_info}")
     creds = service_account.Credentials.from_service_account_info(
         sa_info, scopes=["https://www.googleapis.com/auth/drive"]
     )
