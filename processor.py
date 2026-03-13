@@ -56,9 +56,11 @@ def remove_background(image_bytes: bytes, api_key: str, max_retries: int = 4) ->
         if response.status_code == 200:
             return response.content
         if response.status_code == 429 and attempt < max_retries:
-            wait = 5 * (2 ** attempt)  # 5s, 10s, 20s, 40s
-            log.warning(f"  Rate limit 429, waiting {wait}s (attempt {attempt+1}/{max_retries})")
-            time.sleep(wait)
+            # Use Retry-After header if available, otherwise fallback
+            wait = int(response.headers.get("Retry-After", 5 * (2 ** attempt)))
+            remaining = response.headers.get("X-RateLimit-Remaining", "?")
+            log.warning(f"  Rate limit 429, Retry-After={wait}s, remaining={remaining} (attempt {attempt+1}/{max_retries})")
+            time.sleep(wait + 1)  # +1s safety margin
             continue
         raise Exception(f"remove.bg Fehler: {response.status_code} {response.text}")
     raise Exception("remove.bg: max retries exceeded")
