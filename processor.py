@@ -39,7 +39,9 @@ def check_quality(image_bytes: bytes) -> tuple:
 def prepare_image(image_bytes: bytes) -> bytes:
     """Auto-Kontrast + Schärfung + Resize auf max 1024px VOR rembg.
     BiRefNet wurde auf 1024x1024 trainiert — größere Inputs geben schlechtere Ergebnisse."""
-    img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    img = Image.open(io.BytesIO(image_bytes))
+    img = ImageOps.exif_transpose(img)
+    img = img.convert("RGB")
     img = ImageOps.autocontrast(img, cutoff=1)
     img = ImageEnhance.Sharpness(img).enhance(1.3)
     if max(img.size) > 1024:
@@ -147,15 +149,71 @@ def keep_largest_component(png_bytes: bytes) -> bytes:
 
 
 # ============================================================
+# Step 2d: Auto White Balance on foreground object only
+# ============================================================
+def auto_white_balance(png_bytes: bytes) -> bytes:
+    """Korrigiert Farbstich (Gelb/Blau) NUR am Objekt, nicht am transparenten HG.
+    Analysiert opake Pixel, verschiebt Kanäle Richtung Neutralgrau."""
+    img = Image.open(io.BytesIO(png_bytes)).convert("RGBA")
+    r, g, b, a = img.split()
+    alpha_arr = np.array(a)
+    mask = alpha_arr > 128
+
+    if mask.sum() < 100:
+        return png_bytes
+
+    r_arr = np.array(r, dtype=float)
+    g_arr = np.array(g, dtype=float)
+    b_arr = np.array(b, dtype=float)
+
+    r_mean = r_arr[mask].mean()
+    g_mean = g_arr[mask].mean()
+    b_mean = b_arr[mask].mean()
+    gray_mean = (r_mean + g_mean + b_mean) / 3.0
+
+    if gray_mean < 1:
+        return png_bytes
+
+    r_scale = gray_mean / max(r_mean, 1)
+    g_scale = gray_mean / max(g_mean, 1)
+    b_scale = gray_mean / max(b_mean, 1)
+
+    max_shift = 1.15
+    r_scale = np.clip(r_scale, 1 / max_shift, max_shift)
+    g_scale = np.clip(g_scale, 1 / max_shift, max_shift)
+    b_scale = np.clip(b_scale, 1 / max_shift, max_shift)
+
+    r_arr = np.clip(r_arr * r_scale, 0, 255).astype(np.uint8)
+    g_arr = np.clip(g_arr * g_scale, 0, 255).astype(np.uint8)
+    b_arr = np.clip(b_arr * b_scale, 0, 255).astype(np.uint8)
+
+    r = Image.fromarray(r_arr)
+    g = Image.fromarray(g_arr)
+    b = Image.fromarray(b_arr)
+    img = Image.merge("RGBA", (r, g, b, a))
+
+    output = io.BytesIO()
+    img.save(output, format="PNG")
+    return output.getvalue()
+
+
+# ============================================================
 # Step 3: Result Check (too much removed?)
 # ============================================================
 def check_result(png_bytes: bytes) -> tuple:
-    """Check if API removed too much (>92% transparent)."""
+    """Check if API removed too much (>92% transparent). Logs foreground ratio."""
     img = Image.open(io.BytesIO(png_bytes)).convert("RGBA")
     alpha = np.array(img.split()[3])
     transparent_ratio = (alpha < 15).mean()
+    fg_ratio = 1.0 - transparent_ratio
     if transparent_ratio > 0.92:
         return False, f"API hat zu viel entfernt ({transparent_ratio*100:.0f}% transparent)"
+    if fg_ratio < 0.15:
+        log.warning(f"  ⚠️ Objekt sehr klein ({fg_ratio*100:.0f}% Vordergrund) — möglicherweise falsches Objekt erkannt")
+    elif fg_ratio > 0.85:
+        log.warning(f"  ⚠️ Fast nichts entfernt ({fg_ratio*100:.0f}% Vordergrund) — HG-Entfernung evtl. fehlgeschlagen")
+    else:
+        log.info(f"  Vordergrund: {fg_ratio*100:.0f}%")
     return True, "OK"
 
 
@@ -203,7 +261,8 @@ def add_shadow(png_bytes: bytes) -> bytes:
 # Step 5: Crop + Center on transparent canvas (keeps RGBA)
 # ============================================================
 def crop_and_center(png_bytes: bytes) -> bytes:
-    """Crop to content bounding box via alpha, center with 5% margin. Returns RGBA PNG."""
+    """Crop to content bounding box, smart padding based on object size. Returns RGBA PNG.
+    Small objects get more padding (15%), large objects less (3%)."""
     img = Image.open(io.BytesIO(png_bytes)).convert("RGBA")
     alpha = np.array(img.split()[3])
 
@@ -221,8 +280,21 @@ def crop_and_center(png_bytes: bytes) -> bytes:
     cropped = img.crop((x_min, y_min, x_max + 1, y_max + 1))
     cw, ch = cropped.size
 
-    margin_x = int(cw * 0.05)
-    margin_y = int(ch * 0.05)
+    img_area = img.size[0] * img.size[1]
+    obj_area = cw * ch
+    fill_ratio = obj_area / max(img_area, 1)
+
+    if fill_ratio < 0.10:
+        margin_pct = 0.15
+    elif fill_ratio < 0.30:
+        margin_pct = 0.10
+    elif fill_ratio < 0.60:
+        margin_pct = 0.07
+    else:
+        margin_pct = 0.03
+
+    margin_x = int(cw * margin_pct)
+    margin_y = int(ch * margin_pct)
     canvas_w = cw + 2 * margin_x
     canvas_h = ch + 2 * margin_y
 
@@ -235,15 +307,25 @@ def crop_and_center(png_bytes: bytes) -> bytes:
 
 
 # ============================================================
-# Step 6: Resize to max 2400px
+# Step 6: Resize to square 1:1 (2000x2000px, marketplace-ready)
 # ============================================================
-def resize_final(image_bytes: bytes, max_px: int = 2400) -> bytes:
-    """Resize to max_px, never upscale."""
+def resize_final(image_bytes: bytes, target_size: int = 2000) -> bytes:
+    """Pad to square 1:1 canvas, center object, white BG. Output: target_size x target_size JPEG."""
     img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-    if max(img.size) > max_px:
-        img.thumbnail((max_px, max_px), Image.LANCZOS)
+
+    # Shrink to fit inside target_size (never upscale beyond original)
+    if max(img.size) > target_size:
+        img.thumbnail((target_size, target_size), Image.LANCZOS)
+
+    # Pad to square: center on white canvas
+    w, h = img.size
+    canvas = Image.new("RGB", (target_size, target_size), (255, 255, 255))
+    x = (target_size - w) // 2
+    y = (target_size - h) // 2
+    canvas.paste(img, (x, y))
+
     output = io.BytesIO()
-    img.save(output, format="JPEG", quality=90)
+    canvas.save(output, format="JPEG", quality=90)
     return output.getvalue()
 
 
@@ -275,6 +357,9 @@ def process_image(image_bytes: bytes, filename: str, rembg_url: str = "") -> tup
 
     # 2c. Keep only largest foreground region (remove artifact islands)
     result = keep_largest_component(result)
+
+    # 2d. Auto white balance on foreground object (fix color cast)
+    result = auto_white_balance(result)
 
     # 3. Result check (on alpha channel)
     ok, reason = check_result(result)
