@@ -8,3 +8,4 @@ google-auth-oauthlib==1.2.1
 tenacity==8.5.0
 schedule==1.2.2
 python-dotenv==1.0.1
+scipy==1.13.1
