@@ -19,8 +19,12 @@ REMBG_URL = os.environ.get("REMBG_URL", "https://rembg-new-production.up.railway
 # ============================================================
 # Step 1: Quality Check BEFORE API (free)
 # ============================================================
-def check_quality(image_bytes: bytes) -> tuple:
-    """Check blur + brightness. Returns (ok, reason)."""
+SKIP_PATTERNS = ("_attr", "_bkgrd", "_weiss", "_Photoroom", "-Photoroom")
+
+def check_quality(image_bytes: bytes, filename: str = "") -> tuple:
+    """Check filename patterns, blur + brightness. Returns (ok, reason)."""
+    if any(p in filename for p in SKIP_PATTERNS):
+        return False, f"Dateiname-Skip ({filename})"
     img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
     gray = img.convert("L")
     arr = np.array(gray, dtype=float)
@@ -42,6 +46,16 @@ def prepare_image(image_bytes: bytes) -> bytes:
     img = Image.open(io.BytesIO(image_bytes))
     img = ImageOps.exif_transpose(img)
     img = img.convert("RGB")
+
+    # Center Crop 80%: entfernt Decke/Boden am Rand, rembg fokussiert besser auf Möbel
+    w, h = img.size
+    crop_pct = 0.10
+    left = int(w * crop_pct)
+    top = int(h * crop_pct)
+    right = w - left
+    bottom = h - top
+    img = img.crop((left, top, right, bottom))
+
     img = ImageOps.autocontrast(img, cutoff=1)
     img = ImageEnhance.Sharpness(img).enhance(1.3)
     if max(img.size) > 1024:
@@ -198,6 +212,88 @@ def auto_white_balance(png_bytes: bytes) -> bytes:
 
 
 # ============================================================
+# Step 2e: Color Despill — Farbsäume an Kanten entfernen
+# ============================================================
+def color_despill(png_bytes: bytes) -> bytes:
+    """Korrigiert Farbkontamination an Kanten (wo Alpha 10-200).
+    Ersetzt Kantenfarbe durch die Durchschnittsfarbe des Objekt-Inneren."""
+    img = Image.open(io.BytesIO(png_bytes)).convert("RGBA")
+    r, g, b, a = img.split()
+    alpha_arr = np.array(a)
+    r_arr = np.array(r, dtype=float)
+    g_arr = np.array(g, dtype=float)
+    b_arr = np.array(b, dtype=float)
+
+    interior = alpha_arr > 200
+    edge = (alpha_arr > 10) & (alpha_arr <= 200)
+
+    if interior.sum() < 100 or edge.sum() < 10:
+        return png_bytes
+
+    r_int = r_arr[interior].mean()
+    g_int = g_arr[interior].mean()
+    b_int = b_arr[interior].mean()
+
+    blend = (alpha_arr[edge].astype(float) - 10) / 190.0
+    r_arr[edge] = r_arr[edge] * blend + r_int * (1 - blend)
+    g_arr[edge] = g_arr[edge] * blend + g_int * (1 - blend)
+    b_arr[edge] = b_arr[edge] * blend + b_int * (1 - blend)
+
+    r = Image.fromarray(np.clip(r_arr, 0, 255).astype(np.uint8))
+    g = Image.fromarray(np.clip(g_arr, 0, 255).astype(np.uint8))
+    b = Image.fromarray(np.clip(b_arr, 0, 255).astype(np.uint8))
+    img = Image.merge("RGBA", (r, g, b, a))
+
+    output = io.BytesIO()
+    img.save(output, format="PNG")
+    return output.getvalue()
+
+
+# ============================================================
+# Step 2f: Gamma-Korrektur für dunkle Möbel
+# ============================================================
+def gamma_correct(png_bytes: bytes) -> bytes:
+    """Hebt dunkle Objekte leicht an (Gamma 1.2–1.4) damit Details auf weißem HG sichtbar bleiben.
+    Nur auf Vordergrund-Pixel, nur wenn Objekt dunkel (mean < 100)."""
+    img = Image.open(io.BytesIO(png_bytes)).convert("RGBA")
+    r, g, b, a = img.split()
+    alpha_arr = np.array(a)
+    mask = alpha_arr > 128
+
+    if mask.sum() < 100:
+        return png_bytes
+
+    r_arr = np.array(r, dtype=float)
+    g_arr = np.array(g, dtype=float)
+    b_arr = np.array(b, dtype=float)
+
+    obj_mean = (r_arr[mask].mean() + g_arr[mask].mean() + b_arr[mask].mean()) / 3.0
+
+    if obj_mean >= 100:
+        return png_bytes
+
+    gamma = 1.2 if obj_mean > 60 else 1.4
+    lut = np.array([((i / 255.0) ** (1.0 / gamma)) * 255 for i in range(256)], dtype=np.uint8)
+
+    r_arr = lut[np.array(r)]
+    g_arr = lut[np.array(g)]
+    b_arr = lut[np.array(b)]
+
+    r_arr[~mask] = np.array(r)[~mask]
+    g_arr[~mask] = np.array(g)[~mask]
+    b_arr[~mask] = np.array(b)[~mask]
+
+    r = Image.fromarray(r_arr)
+    g = Image.fromarray(g_arr)
+    b = Image.fromarray(b_arr)
+    img = Image.merge("RGBA", (r, g, b, a))
+
+    output = io.BytesIO()
+    img.save(output, format="PNG")
+    return output.getvalue()
+
+
+# ============================================================
 # Step 3: Result Check (too much removed?)
 # ============================================================
 def check_result(png_bytes: bytes) -> tuple:
@@ -218,35 +314,37 @@ def check_result(png_bytes: bytes) -> tuple:
 
 
 # ============================================================
-# Step 4: Soft Drop Shadow + White BG (Pillow-based)
+# Step 4: Floor Shadow + White BG (realistic furniture shadow)
 # ============================================================
 def add_shadow(png_bytes: bytes) -> bytes:
-    """Weicher Schlagschatten + weisser Hintergrund. Input: RGBA PNG, Output: JPEG."""
+    """Realistischer Boden-Schatten (direkt unter Objekt, breiter als tief).
+    Kein diagonaler Drop-Shadow — professioneller Möbelfotografie-Look.
+    Input: RGBA PNG, Output: JPEG."""
     img = Image.open(io.BytesIO(png_bytes)).convert("RGBA")
     alpha = img.split()[3]
     w, h = img.size
 
-    shadow_offset = (6, 10)
-    shadow_blur = 15
-    shadow_opacity = 50
     pad = 40
+    shadow_blur_x = 20
+    shadow_blur_y = 8
+    shadow_opacity = 40
+    shadow_drop = 6
 
-    shadow = Image.new("RGBA", (w + pad, h + pad), (0, 0, 0, 0))
+    shadow = Image.new("L", (w + pad, h + pad), 0)
     shadow_alpha = alpha.copy()
-    shadow_layer = Image.new("RGBA", alpha.size, (0, 0, 0, 0))
-    shadow_layer.putalpha(shadow_alpha)
-    ox = pad // 2 + shadow_offset[0]
-    oy = pad // 2 + shadow_offset[1]
-    shadow.paste(shadow_layer, (ox, oy))
-    shadow = shadow.filter(ImageFilter.GaussianBlur(shadow_blur))
+    shadow.paste(shadow_alpha, (pad // 2, pad // 2 + shadow_drop))
 
-    shadow_arr = np.array(shadow)
-    shadow_arr[:, :, :3] = 80
-    shadow_arr[:, :, 3] = (shadow_arr[:, :, 3].astype(float) * shadow_opacity / 100).astype(np.uint8)
-    shadow = Image.fromarray(shadow_arr)
+    shadow_arr = np.array(shadow, dtype=float)
+    shadow_arr = ndimage.gaussian_filter(shadow_arr, sigma=[shadow_blur_y, shadow_blur_x])
+
+    shadow_arr = np.clip(shadow_arr * shadow_opacity / 100, 0, 255).astype(np.uint8)
+
+    shadow_rgba = Image.new("RGBA", (w + pad, h + pad), (0, 0, 0, 0))
+    shadow_layer = Image.new("RGBA", shadow_rgba.size, (60, 60, 60, 0))
+    shadow_layer.putalpha(Image.fromarray(shadow_arr))
 
     canvas = Image.new("RGBA", (w + pad, h + pad), (255, 255, 255, 255))
-    canvas = Image.alpha_composite(canvas, shadow)
+    canvas = Image.alpha_composite(canvas, shadow_layer)
     canvas.paste(img, (pad // 2, pad // 2), img)
 
     result = Image.new("RGB", canvas.size, (255, 255, 255))
@@ -310,18 +408,27 @@ def crop_and_center(png_bytes: bytes) -> bytes:
 # Step 6: Resize to square 1:1 (2000x2000px, marketplace-ready)
 # ============================================================
 def resize_final(image_bytes: bytes, target_size: int = 2000) -> bytes:
-    """Pad to square 1:1 canvas, center object, white BG. Output: target_size x target_size JPEG."""
+    """Pad to square 1:1 or 4:5 portrait canvas, center object, white BG.
+    Very tall objects (h > 1.8*w) get 4:5 to avoid looking tiny in 1:1."""
     img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-
-    # Shrink to fit inside target_size (never upscale beyond original)
-    if max(img.size) > target_size:
-        img.thumbnail((target_size, target_size), Image.LANCZOS)
-
-    # Pad to square: center on white canvas
     w, h = img.size
-    canvas = Image.new("RGB", (target_size, target_size), (255, 255, 255))
-    x = (target_size - w) // 2
-    y = (target_size - h) // 2
+
+    # Aspect ratio guard: tall objects → 4:5 portrait, otherwise 1:1 square
+    if h > 1.8 * w:
+        canvas_w = target_size
+        canvas_h = int(target_size * 5 / 4)
+    else:
+        canvas_w = target_size
+        canvas_h = target_size
+
+    # Shrink to fit inside canvas (never upscale beyond original)
+    img.thumbnail((canvas_w, canvas_h), Image.LANCZOS)
+    iw, ih = img.size
+
+    # Center on white canvas
+    canvas = Image.new("RGB", (canvas_w, canvas_h), (255, 255, 255))
+    x = (canvas_w - iw) // 2
+    y = (canvas_h - ih) // 2
     canvas.paste(img, (x, y))
 
     output = io.BytesIO()
@@ -338,8 +445,8 @@ def process_image(image_bytes: bytes, filename: str, rembg_url: str = "") -> tup
     → Crop/Center → Shadow+WhiteBG → Resize.
     Returns (result_bytes | None, status_message).
     """
-    # 1. Quality check
-    ok, reason = check_quality(image_bytes)
+    # 1. Quality check (incl. filename pattern skip)
+    ok, reason = check_quality(image_bytes, filename)
     if not ok:
         return None, f"SKIP Qualit\u00e4t: {reason}"
 
@@ -360,6 +467,12 @@ def process_image(image_bytes: bytes, filename: str, rembg_url: str = "") -> tup
 
     # 2d. Auto white balance on foreground object (fix color cast)
     result = auto_white_balance(result)
+
+    # 2e. Color despill (fix color bleeding at edges from original background)
+    result = color_despill(result)
+
+    # 2f. Gamma correction for dark furniture (lift details on white BG)
+    result = gamma_correct(result)
 
     # 3. Result check (on alpha channel)
     ok, reason = check_result(result)
