@@ -449,6 +449,12 @@ def process_image(image_bytes: bytes, filename: str, rembg_url: str = "") -> tup
     except Exception as e:
         return None, f"FEHLER API: {e}"
 
+    # Diagnose: FG-Ratio direkt nach rembg (vor jeglicher Post-Verarbeitung)
+    _diag_img = Image.open(io.BytesIO(result)).convert("RGBA")
+    _diag_alpha = np.array(_diag_img.split()[3])
+    _diag_fg = (_diag_alpha > 15).mean()
+    log.info(f"  [DIAG] rembg raw FG: {_diag_fg*100:.0f}%  (alpha>15 = Vordergrund)")
+
     # 2b. Edge cleanup (median filter on alpha channel)
     result = cleanup_edges(result)
 
