@@ -66,8 +66,12 @@ def prepare_image(image_bytes: bytes) -> bytes:
 # ============================================================
 # Step 2: rembg API (self-hosted, free) — PNG for alpha channel
 # ============================================================
-def remove_background(image_bytes: bytes, max_retries: int = 3, model: str = "birefnet-general-lite") -> bytes:
-    """Call self-hosted rembg, returns PNG with alpha channel."""
+RETRY_DELAYS = [5, 10, 20]  # Sekunden Wartezeit pro Retry
+IMAGE_DEADLINE = 120        # Max. Sekunden pro Bild (inkl. aller Retries)
+
+def remove_background(image_bytes: bytes, max_retries: int = 3, model: str = "birefnet-general-lite", deadline: float = 0) -> bytes:
+    """Call self-hosted rembg, returns PNG with alpha channel.
+    deadline: time.time()-Wert, ab dem abgebrochen wird (0 = kein Limit)."""
     url = f"{REMBG_URL}/remove-bg"
     params = {
         "model": model,
@@ -75,25 +79,28 @@ def remove_background(image_bytes: bytes, max_retries: int = 3, model: str = "bi
         "post_process_mask": "true",
     }
     for attempt in range(max_retries + 1):
+        if deadline and time.time() > deadline:
+            raise Exception("rembg: Zeitlimit überschritten")
         try:
             response = requests.post(
                 url,
                 params=params,
                 files={"image": ("image.jpg", image_bytes, "image/jpeg")},
-                timeout=90,
+                timeout=45,
             )
             if response.status_code == 200:
                 return response.content
             if response.status_code in (502, 503) and attempt < max_retries:
-                wait = 15 * (attempt + 1)
-                log.warning(f"  rembg {response.status_code}, retry in {wait}s (attempt {attempt+1}/{max_retries})")
-                time.sleep(wait)
+                delay = RETRY_DELAYS[min(attempt, len(RETRY_DELAYS) - 1)]
+                log.warning(f"  rembg {response.status_code}, retry in {delay}s (attempt {attempt+1}/{max_retries})")
+                time.sleep(delay)
                 continue
             raise Exception(f"rembg Fehler: {response.status_code} {response.text[:200]}")
         except requests.exceptions.Timeout:
             if attempt < max_retries:
-                log.warning(f"  rembg timeout, retry (attempt {attempt+1}/{max_retries})")
-                time.sleep(5)
+                delay = RETRY_DELAYS[min(attempt, len(RETRY_DELAYS) - 1)]
+                log.warning(f"  rembg timeout, retry in {delay}s (attempt {attempt+1}/{max_retries})")
+                time.sleep(delay)
                 continue
             raise Exception("rembg: timeout after all retries")
     raise Exception("rembg: max retries exceeded")
@@ -452,8 +459,9 @@ def process_image(image_bytes: bytes, filename: str, rembg_url: str = "") -> tup
     prepared = prepare_image(image_bytes)
 
     # 2. rembg API (free, self-hosted) — returns PNG with alpha
+    deadline = time.time() + IMAGE_DEADLINE
     try:
-        result = remove_background(prepared)
+        result = remove_background(prepared, deadline=deadline)
     except Exception as e:
         return None, f"FEHLER API: {e}"
 
@@ -467,7 +475,7 @@ def process_image(image_bytes: bytes, filename: str, rembg_url: str = "") -> tup
     if _diag_fg > 0.90:
         log.warning(f"  ⚠️ FG {_diag_fg*100:.0f}% > 90% — Fallback-Modell isnet-general-use")
         try:
-            result = remove_background(prepared, model="isnet-general-use")
+            result = remove_background(prepared, model="isnet-general-use", deadline=deadline)
             _diag_img2 = Image.open(io.BytesIO(result)).convert("RGBA")
             _diag_alpha2 = np.array(_diag_img2.split()[3])
             _diag_fg2 = (_diag_alpha2 > 15).mean()
@@ -476,7 +484,7 @@ def process_image(image_bytes: bytes, filename: str, rembg_url: str = "") -> tup
                 log.info(f"  ✅ Fallback besser ({_diag_fg*100:.0f}% → {_diag_fg2*100:.0f}%)")
             else:
                 log.info(f"  ↩️ Fallback nicht besser, behalte Original")
-                result = remove_background(prepared)  # re-run original
+                result = remove_background(prepared, deadline=deadline)
         except Exception as e:
             log.warning(f"  Fallback fehlgeschlagen: {e} — behalte Original")
 

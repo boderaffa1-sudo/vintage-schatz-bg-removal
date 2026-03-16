@@ -11,6 +11,7 @@ import logging
 import threading
 from pathlib import Path
 from http.server import HTTPServer, BaseHTTPRequestHandler
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests as http_requests
 
@@ -187,7 +188,8 @@ def process_folder(service, folder_id, folder_name, stats):
 
     log.info(f"  {len(to_process)} images to process")
 
-    for img_file in to_process:
+    def _process_one(img_file):
+        """Process a single image (download → rembg → upload). Thread-safe."""
         name = img_file["name"]
         file_id = img_file["id"]
         weiss_name = get_weiss_name(name)
@@ -197,30 +199,39 @@ def process_folder(service, folder_id, folder_name, stats):
 
         if DRY_RUN:
             log.info(f"  [DRY RUN] Would create: {weiss_name}")
-            continue
+            return
 
         try:
-            # Download
             raw_bytes = download_file(service, file_id)
             log.info(f"  Downloaded: {len(raw_bytes):,} bytes")
 
-            # Process via rembg pipeline (free, self-hosted)
             result_bytes, status = process_image(raw_bytes, name)
 
             if result_bytes is None:
                 log.warning(f"  ⏭️ {status}")
+                if "Zeitlimit" in status:
+                    stats["timeout_skips"] = stats.get("timeout_skips", 0) + 1
                 stats["skipped"] += 1
-                continue
+                return
 
             log.info(f"  ✅ {status} — {len(result_bytes):,} bytes")
 
-            # Upload
             upload_file(service, folder_id, weiss_name, result_bytes)
             stats["uploaded"] += 1
 
         except Exception as e:
             log.error(f"  ❌ Error: {name} — {e}", exc_info=True)
             stats["errors"] += 1
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = {executor.submit(_process_one, img): img for img in to_process}
+        for future in as_completed(futures):
+            try:
+                future.result()
+            except Exception as e:
+                img = futures[future]
+                log.error(f"  ❌ Thread-Error: {img['name']} — {e}")
+                stats["errors"] += 1
 
 
 def process_recursive(service, folder_id, folder_name, stats, depth=0):
@@ -257,7 +268,8 @@ def main():
 
     while True:
         try:
-            cycle_stats = {"processed": 0, "uploaded": 0, "skipped": 0, "errors": 0}
+            cycle_stats = {"processed": 0, "uploaded": 0, "skipped": 0, "errors": 0, "timeout_skips": 0}
+            cycle_start = time.time()
             log.info(f"\n{'='*30} POLL START {'='*30}")
 
             process_recursive(service, GDRIVE_ROOT_FOLDER_ID, "ROOT", cycle_stats)
@@ -268,11 +280,16 @@ def main():
             stats_total["errors"] += cycle_stats["errors"]
             stats_total["cycles"] += 1
 
+            cycle_duration = int(time.time() - cycle_start)
+            cycle_min = cycle_duration // 60
+
             log.info(f"\n--- Cycle Summary ---")
             log.info(f"  Processed: {cycle_stats['processed']}")
             log.info(f"  Uploaded:  {cycle_stats['uploaded']}")
             log.info(f"  Skipped:   {cycle_stats['skipped']}")
             log.info(f"  Errors:    {cycle_stats['errors']}")
+            log.info(f"  Timeouts:  {cycle_stats['timeout_skips']}")
+            log.info(f"  Duration:  {cycle_min} min")
 
             # Telegram-Summary (nur wenn etwas passiert ist)
             if cycle_stats["processed"] > 0 or cycle_stats["errors"] > 0:
@@ -282,7 +299,9 @@ def main():
                     f"🖼 Verarbeitet: {cycle_stats['processed']}\n"
                     f"⬆️ Hochgeladen: {cycle_stats['uploaded']}\n"
                     f"⏭️ Übersprungen: {cycle_stats['skipped']}\n"
-                    f"❌ Fehler: {cycle_stats['errors']}"
+                    f"❌ Fehler: {cycle_stats['errors']}\n"
+                    f"⏱️ Zeitlimit: {cycle_stats['timeout_skips']}\n"
+                    f"⏰ Dauer: {cycle_min} Min"
                 )
 
         except Exception as e:
