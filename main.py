@@ -17,6 +17,21 @@ import requests as http_requests
 from gdrive import authenticate, list_subfolders, list_images, download_file, upload_file
 from processor import process_image
 
+
+def send_telegram(text: str):
+    """Send a message via Telegram bot. Silently fails if not configured."""
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        http_requests.post(url, json={
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": text,
+            "parse_mode": "HTML",
+        }, timeout=10)
+    except Exception as e:
+        logging.getLogger("whitebg").warning(f"Telegram send failed: {e}")
+
 # ============================================================
 # Configuration
 # ============================================================
@@ -25,6 +40,10 @@ GDRIVE_ROOT_FOLDER_ID = os.environ.get("GDRIVE_ROOT_FOLDER_ID", "1nJk2cI1FlOX5a5
 POLL_INTERVAL_MINUTES = int(os.environ.get("POLL_INTERVAL_MINUTES", "60"))
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO")
 DRY_RUN = os.environ.get("DRY_RUN", "false").lower() == "true"
+
+# Telegram notifications
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
 # Airtable config for measurement photo cache
 AIRTABLE_TOKEN = os.environ.get("AIRTABLE_TOKEN", "")
@@ -254,6 +273,17 @@ def main():
             log.info(f"  Uploaded:  {cycle_stats['uploaded']}")
             log.info(f"  Skipped:   {cycle_stats['skipped']}")
             log.info(f"  Errors:    {cycle_stats['errors']}")
+
+            # Telegram-Summary (nur wenn etwas passiert ist)
+            if cycle_stats["processed"] > 0 or cycle_stats["errors"] > 0:
+                emoji = "✅" if cycle_stats["errors"] == 0 else "⚠️"
+                send_telegram(
+                    f"{emoji} <b>WhiteBG Zyklus #{stats_total['cycles']}</b>\n"
+                    f"🖼 Verarbeitet: {cycle_stats['processed']}\n"
+                    f"⬆️ Hochgeladen: {cycle_stats['uploaded']}\n"
+                    f"⏭️ Übersprungen: {cycle_stats['skipped']}\n"
+                    f"❌ Fehler: {cycle_stats['errors']}"
+                )
 
         except Exception as e:
             log.error(f"Poll cycle error: {e}", exc_info=True)

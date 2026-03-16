@@ -21,11 +21,19 @@ REMBG_URL = os.environ.get("REMBG_URL", "https://rembg-new-production.up.railway
 # ============================================================
 SKIP_PATTERNS = ("_attr", "_bkgrd", "_weiss", "_Photoroom", "-Photoroom")
 
+MIN_IMAGE_SIZE = 200   # px — Bilder kleiner als 200x200 überspringen
+MIN_FILE_SIZE = 20480  # 20 KB — zu kleine Dateien (Thumbnails) überspringen
+
 def check_quality(image_bytes: bytes, filename: str = "") -> tuple:
-    """Check filename patterns, blur + brightness. Returns (ok, reason)."""
+    """Check filename patterns, file size, dimensions, blur + brightness. Returns (ok, reason)."""
     if any(p in filename for p in SKIP_PATTERNS):
         return False, f"Dateiname-Skip ({filename})"
+    if len(image_bytes) < MIN_FILE_SIZE:
+        return False, f"Datei zu klein ({len(image_bytes):,} bytes < {MIN_FILE_SIZE:,})"
     img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    w, h = img.size
+    if w < MIN_IMAGE_SIZE or h < MIN_IMAGE_SIZE:
+        return False, f"Bild zu klein ({w}x{h} < {MIN_IMAGE_SIZE}x{MIN_IMAGE_SIZE})"
     gray = img.convert("L")
     arr = np.array(gray, dtype=float)
     laplacian = np.abs(np.diff(np.diff(arr, axis=0), axis=0)).mean()
@@ -58,11 +66,11 @@ def prepare_image(image_bytes: bytes) -> bytes:
 # ============================================================
 # Step 2: rembg API (self-hosted, free) — PNG for alpha channel
 # ============================================================
-def remove_background(image_bytes: bytes, max_retries: int = 3) -> bytes:
+def remove_background(image_bytes: bytes, max_retries: int = 3, model: str = "birefnet-general-lite") -> bytes:
     """Call self-hosted rembg, returns PNG with alpha channel."""
     url = f"{REMBG_URL}/remove-bg"
     params = {
-        "model": "birefnet-general-lite",
+        "model": model,
         "format": "png",
         "post_process_mask": "true",
     }
@@ -454,6 +462,23 @@ def process_image(image_bytes: bytes, filename: str, rembg_url: str = "") -> tup
     _diag_alpha = np.array(_diag_img.split()[3])
     _diag_fg = (_diag_alpha > 15).mean()
     log.info(f"  [DIAG] rembg raw FG: {_diag_fg*100:.0f}%  (alpha>15 = Vordergrund)")
+
+    # Fallback: wenn FG > 90% → retry mit isnet-general-use
+    if _diag_fg > 0.90:
+        log.warning(f"  ⚠️ FG {_diag_fg*100:.0f}% > 90% — Fallback-Modell isnet-general-use")
+        try:
+            result = remove_background(prepared, model="isnet-general-use")
+            _diag_img2 = Image.open(io.BytesIO(result)).convert("RGBA")
+            _diag_alpha2 = np.array(_diag_img2.split()[3])
+            _diag_fg2 = (_diag_alpha2 > 15).mean()
+            log.info(f"  [DIAG] Fallback FG: {_diag_fg2*100:.0f}%")
+            if _diag_fg2 < _diag_fg:
+                log.info(f"  ✅ Fallback besser ({_diag_fg*100:.0f}% → {_diag_fg2*100:.0f}%)")
+            else:
+                log.info(f"  ↩️ Fallback nicht besser, behalte Original")
+                result = remove_background(prepared)  # re-run original
+        except Exception as e:
+            log.warning(f"  Fallback fehlgeschlagen: {e} — behalte Original")
 
     # 2b. Edge cleanup (median filter on alpha channel)
     result = cleanup_edges(result)
