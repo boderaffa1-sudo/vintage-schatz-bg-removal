@@ -46,16 +46,6 @@ def prepare_image(image_bytes: bytes) -> bytes:
     img = Image.open(io.BytesIO(image_bytes))
     img = ImageOps.exif_transpose(img)
     img = img.convert("RGB")
-
-    # Center Crop 80%: entfernt Decke/Boden am Rand, rembg fokussiert besser auf Möbel
-    w, h = img.size
-    crop_pct = 0.10
-    left = int(w * crop_pct)
-    top = int(h * crop_pct)
-    right = w - left
-    bottom = h - top
-    img = img.crop((left, top, right, bottom))
-
     img = ImageOps.autocontrast(img, cutoff=1)
     img = ImageEnhance.Sharpness(img).enhance(1.3)
     if max(img.size) > 1024:
@@ -86,9 +76,9 @@ def remove_background(image_bytes: bytes, max_retries: int = 3) -> bytes:
             )
             if response.status_code == 200:
                 return response.content
-            if response.status_code == 503 and attempt < max_retries:
-                wait = 10 * (attempt + 1)
-                log.warning(f"  rembg 503, retry in {wait}s (attempt {attempt+1}/{max_retries})")
+            if response.status_code in (502, 503) and attempt < max_retries:
+                wait = 15 * (attempt + 1)
+                log.warning(f"  rembg {response.status_code}, retry in {wait}s (attempt {attempt+1}/{max_retries})")
                 time.sleep(wait)
                 continue
             raise Exception(f"rembg Fehler: {response.status_code} {response.text[:200]}")
