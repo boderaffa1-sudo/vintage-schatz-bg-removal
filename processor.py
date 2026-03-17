@@ -508,6 +508,7 @@ def process_image(image_bytes: bytes, filename: str, rembg_url: str = "") -> tup
     result = add_shadow(result)
 
     # 6. Resize
-    result = resize_final(result)
+    # DISABLED: Preserve original size from poof.bg
+    # result = resize_final(result)
 
     return result, "OK"
