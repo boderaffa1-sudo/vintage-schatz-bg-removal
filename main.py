@@ -11,7 +11,6 @@ import logging
 import threading
 from pathlib import Path
 from http.server import HTTPServer, BaseHTTPRequestHandler
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests as http_requests
 
@@ -188,8 +187,7 @@ def process_folder(service, folder_id, folder_name, stats):
 
     log.info(f"  {len(to_process)} images to process")
 
-    def _process_one(img_file):
-        """Process a single image (download → rembg → upload). Thread-safe."""
+    for img_file in to_process:
         name = img_file["name"]
         file_id = img_file["id"]
         weiss_name = get_weiss_name(name)
@@ -199,7 +197,7 @@ def process_folder(service, folder_id, folder_name, stats):
 
         if DRY_RUN:
             log.info(f"  [DRY RUN] Would create: {weiss_name}")
-            return
+            continue
 
         try:
             raw_bytes = download_file(service, file_id)
@@ -212,7 +210,7 @@ def process_folder(service, folder_id, folder_name, stats):
                 if "Zeitlimit" in status:
                     stats["timeout_skips"] = stats.get("timeout_skips", 0) + 1
                 stats["skipped"] += 1
-                return
+                continue
 
             log.info(f"  ✅ {status} — {len(result_bytes):,} bytes")
 
@@ -222,16 +220,6 @@ def process_folder(service, folder_id, folder_name, stats):
         except Exception as e:
             log.error(f"  ❌ Error: {name} — {e}", exc_info=True)
             stats["errors"] += 1
-
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        futures = {executor.submit(_process_one, img): img for img in to_process}
-        for future in as_completed(futures):
-            try:
-                future.result()
-            except Exception as e:
-                img = futures[future]
-                log.error(f"  ❌ Thread-Error: {img['name']} — {e}")
-                stats["errors"] += 1
 
 
 def process_recursive(service, folder_id, folder_name, stats, depth=0):
