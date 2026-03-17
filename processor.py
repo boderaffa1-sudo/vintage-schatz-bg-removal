@@ -1,5 +1,5 @@
-"""Image processing via self-hosted rembg on Railway.
-Pipeline: Quality Check → Prepare → rembg (PNG+Alpha) → Edge Cleanup → Result Check → Shadow → Crop/Center → Resize
+"""Image processing via poof.bg API.
+Pipeline: Quality Check → Prepare → poof.bg (PNG+Alpha) → Edge Cleanup → Result Check → Shadow → Crop/Center → Resize
 """
 import io
 import logging
@@ -13,7 +13,8 @@ from scipy import ndimage
 
 log = logging.getLogger("whitebg.processor")
 
-REMBG_URL = os.environ.get("REMBG_URL", "https://rembg-new-production.up.railway.app")
+POOF_API_KEY = os.environ.get("POOF_API_KEY", "")
+POOF_URL = "https://api.poof.bg/v1/remove"
 
 
 # ============================================================
@@ -64,46 +65,52 @@ def prepare_image(image_bytes: bytes) -> bytes:
 
 
 # ============================================================
-# Step 2: rembg API (self-hosted, free) — PNG for alpha channel
+# Step 2: poof.bg API — PNG for alpha channel ($0.001/image)
 # ============================================================
 RETRY_DELAYS = [5, 10, 20]  # Sekunden Wartezeit pro Retry
 IMAGE_DEADLINE = 120        # Max. Sekunden pro Bild (inkl. aller Retries)
 
-def remove_background(image_bytes: bytes, max_retries: int = 3, model: str = "birefnet-general-lite", deadline: float = 0) -> bytes:
-    """Call self-hosted rembg, returns PNG with alpha channel.
+def remove_background(image_bytes: bytes, max_retries: int = 3, deadline: float = 0, **kwargs) -> bytes:
+    """Call poof.bg API, returns PNG with alpha channel.
     deadline: time.time()-Wert, ab dem abgebrochen wird (0 = kein Limit)."""
-    url = f"{REMBG_URL}/remove-bg"
-    params = {
-        "model": model,
-        "format": "png",
-        "post_process_mask": "true",
-    }
+    if not POOF_API_KEY:
+        raise Exception("POOF_API_KEY nicht gesetzt!")
     for attempt in range(max_retries + 1):
         if deadline and time.time() > deadline:
-            raise Exception("rembg: Zeitlimit überschritten")
+            raise Exception("poof.bg: Zeitlimit überschritten")
         try:
             response = requests.post(
-                url,
-                params=params,
-                files={"image": ("image.jpg", image_bytes, "image/jpeg")},
-                timeout=45,
+                POOF_URL,
+                headers={"x-api-key": POOF_API_KEY},
+                files={"image_file": ("image.jpg", image_bytes, "image/jpeg")},
+                data={"size": "full", "format": "png"},
+                timeout=60,
             )
             if response.status_code == 200:
+                proc_ms = response.headers.get("X-Processing-Time-Ms", "?")
+                log.info(f"  poof.bg OK — {proc_ms}ms")
                 return response.content
-            if response.status_code in (502, 503) and attempt < max_retries:
+            if response.status_code == 429 and attempt < max_retries:
                 delay = RETRY_DELAYS[min(attempt, len(RETRY_DELAYS) - 1)]
-                log.warning(f"  rembg {response.status_code}, retry in {delay}s (attempt {attempt+1}/{max_retries})")
+                log.warning(f"  poof.bg rate-limit, retry in {delay}s (attempt {attempt+1}/{max_retries})")
                 time.sleep(delay)
                 continue
-            raise Exception(f"rembg Fehler: {response.status_code} {response.text[:200]}")
+            if response.status_code == 402:
+                raise Exception("poof.bg: Credits aufgebraucht! Bitte aufladen: dash.poof.bg")
+            if response.status_code in (500, 502, 503) and attempt < max_retries:
+                delay = RETRY_DELAYS[min(attempt, len(RETRY_DELAYS) - 1)]
+                log.warning(f"  poof.bg {response.status_code}, retry in {delay}s (attempt {attempt+1}/{max_retries})")
+                time.sleep(delay)
+                continue
+            raise Exception(f"poof.bg Fehler: {response.status_code} {response.text[:200]}")
         except requests.exceptions.Timeout:
             if attempt < max_retries:
                 delay = RETRY_DELAYS[min(attempt, len(RETRY_DELAYS) - 1)]
-                log.warning(f"  rembg timeout, retry in {delay}s (attempt {attempt+1}/{max_retries})")
+                log.warning(f"  poof.bg timeout, retry in {delay}s (attempt {attempt+1}/{max_retries})")
                 time.sleep(delay)
                 continue
-            raise Exception("rembg: timeout after all retries")
-    raise Exception("rembg: max retries exceeded")
+            raise Exception("poof.bg: timeout after all retries")
+    raise Exception("poof.bg: max retries exceeded")
 
 
 # ============================================================
@@ -458,35 +465,18 @@ def process_image(image_bytes: bytes, filename: str, rembg_url: str = "") -> tup
     # 1b. Prepare (auto-contrast + sharpening + resize to 1024px)
     prepared = prepare_image(image_bytes)
 
-    # 2. rembg API (free, self-hosted) — returns PNG with alpha
+    # 2. poof.bg API ($0.001/image) — returns PNG with alpha
     deadline = time.time() + IMAGE_DEADLINE
     try:
         result = remove_background(prepared, deadline=deadline)
     except Exception as e:
         return None, f"FEHLER API: {e}"
 
-    # Diagnose: FG-Ratio direkt nach rembg (vor jeglicher Post-Verarbeitung)
+    # Diagnose: FG-Ratio direkt nach poof.bg (vor jeglicher Post-Verarbeitung)
     _diag_img = Image.open(io.BytesIO(result)).convert("RGBA")
     _diag_alpha = np.array(_diag_img.split()[3])
     _diag_fg = (_diag_alpha > 15).mean()
-    log.info(f"  [DIAG] rembg raw FG: {_diag_fg*100:.0f}%  (alpha>15 = Vordergrund)")
-
-    # Fallback: wenn FG > 90% → retry mit isnet-general-use
-    if _diag_fg > 0.90:
-        log.warning(f"  ⚠️ FG {_diag_fg*100:.0f}% > 90% — Fallback-Modell isnet-general-use")
-        try:
-            result = remove_background(prepared, model="isnet-general-use", deadline=deadline)
-            _diag_img2 = Image.open(io.BytesIO(result)).convert("RGBA")
-            _diag_alpha2 = np.array(_diag_img2.split()[3])
-            _diag_fg2 = (_diag_alpha2 > 15).mean()
-            log.info(f"  [DIAG] Fallback FG: {_diag_fg2*100:.0f}%")
-            if _diag_fg2 < _diag_fg:
-                log.info(f"  ✅ Fallback besser ({_diag_fg*100:.0f}% → {_diag_fg2*100:.0f}%)")
-            else:
-                log.info(f"  ↩️ Fallback nicht besser, behalte Original")
-                result = remove_background(prepared, deadline=deadline)
-        except Exception as e:
-            log.warning(f"  Fallback fehlgeschlagen: {e} — behalte Original")
+    log.info(f"  [DIAG] poof.bg raw FG: {_diag_fg*100:.0f}%  (alpha>15 = Vordergrund)")
 
     # 2b. Edge cleanup (median filter on alpha channel)
     result = cleanup_edges(result)

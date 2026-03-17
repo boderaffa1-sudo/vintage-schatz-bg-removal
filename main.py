@@ -256,9 +256,9 @@ def process_recursive(service, folder_id, folder_name, stats, depth=0):
 # ============================================================
 def main():
     log.info("=" * 60)
-    log.info("WhiteBG-Service (rembg, free) starting")
+    log.info("WhiteBG-Service (poof.bg) starting")
     log.info(f"  Root folder:  {GDRIVE_ROOT_FOLDER_ID}")
-    log.info(f"  rembg URL:    {os.environ.get('REMBG_URL', 'https://rembg-new-production.up.railway.app')}")
+    log.info(f"  poof.bg:      aktiv ($0.001/Bild)")
     log.info(f"  Poll:         {POLL_INTERVAL_MINUTES} min")
     log.info(f"  Dry run:      {DRY_RUN}")
     log.info("=" * 60)
