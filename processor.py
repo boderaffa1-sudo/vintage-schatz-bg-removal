@@ -485,13 +485,15 @@ def process_image(image_bytes: bytes, filename: str, rembg_url: str = "") -> tup
     result = keep_largest_component(result)
 
     # 2d. Auto white balance on foreground object (fix color cast)
-    result = auto_white_balance(result)
+    # DISABLED: Preserve original colors from poof.bg
+    # result = auto_white_balance(result)
 
     # 2e. Color despill (fix color bleeding at edges from original background)
     result = color_despill(result)
 
     # 2f. Gamma correction for dark furniture (lift details on white BG)
-    result = gamma_correct(result)
+    # DISABLED: Preserve original brightness from poof.bg
+    # result = gamma_correct(result)
 
     # 3. Result check (on alpha channel)
     ok, reason = check_result(result)
@@ -499,7 +501,8 @@ def process_image(image_bytes: bytes, filename: str, rembg_url: str = "") -> tup
         return None, f"SKIP Ergebnis: {reason}"
 
     # 4. Crop + Center (RGBA → RGBA, erst zentrieren vor Shadow!)
-    result = crop_and_center(result)
+    # DISABLED: Preserve original composition from poof.bg
+    # result = crop_and_center(result)
 
     # 5. Shadow + White BG (RGBA → JPEG)
     result = add_shadow(result)
