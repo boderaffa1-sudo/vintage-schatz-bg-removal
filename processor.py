@@ -83,7 +83,7 @@ def remove_background(image_bytes: bytes, max_retries: int = 3, deadline: float 
                 POOF_URL,
                 headers={"x-api-key": POOF_API_KEY},
                 files={"image_file": ("image.jpg", image_bytes, "image/jpeg")},
-                data={"size": "full", "format": "png"},
+                data={"size": "full", "format": "png", "channels": "rgba", "crop": "true"},
                 timeout=60,
             )
             if response.status_code == 200:
